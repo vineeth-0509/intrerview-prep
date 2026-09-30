@@ -31,6 +31,9 @@ export function errorHandler(
   console.error(err);
   return res.status(500).json({
     code: "INTERNAL_ERROR",
-    
+    message:
+      env.NODE_ENV === "development" && err instanceof Error
+        ? err.message
+        : "Something went wrong.",
   });
 }
