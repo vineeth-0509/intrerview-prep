@@ -19,7 +19,7 @@ export function requireAuth(req: Request, _res: Response, next: NextFunction) {
   }
   try {
     const payload = verifyToken(token);
-    
+    req.user = { id: payload.sub };
     next();
   } catch {
     next(new AppError("SESSION_EXPIRED", "Session expired or invalid.", 401));
