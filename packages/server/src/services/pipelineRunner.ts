@@ -2,7 +2,6 @@ import { runPipeline } from "@aipk/core";
 import { Kit } from "../models/Kit";
 import { env } from "../config/env";
 
-
 export async function runAndPersistPipeline(kitId: string): Promise<void> {
   const doc = await Kit.findById(kitId);
   if (!doc) return;
@@ -15,7 +14,14 @@ export async function runAndPersistPipeline(kitId: string): Promise<void> {
     await doc.save();
 
     const result = await runPipeline(
-      
+      {
+        jdText: doc.jd_text,
+        companyUrl: doc.company_url,
+        daysRequested: doc.days_requested,
+        openaiApiKey: env.OPENAI_API_KEY ?? "",
+        serperApiKey: env.SEARCH_API_KEY ?? "",
+        allowLocalFetch: env.ALLOW_LOCAL_FETCH,
+      },
       {
         onStep: async (step) => {
           doc.current_step = step;
@@ -29,13 +35,14 @@ export async function runAndPersistPipeline(kitId: string): Promise<void> {
       doc.pipeline_status = "failed";
       doc.pipeline_error = {
         code: "INVALID_KIT_STRUCTURE",
-        message: result.validationErrors.map((e) => `${e.path}: ${e.message}`).join("; "),
+        message: result.validationErrors
+          .map((e) => `${e.path}: ${e.message}`)
+          .join("; "),
       };
       await doc.save();
       return;
     }
 
-    
     doc.kit = result.kit as unknown as typeof doc.kit;
     doc.pipeline_status = "completed";
     doc.current_step = undefined;
