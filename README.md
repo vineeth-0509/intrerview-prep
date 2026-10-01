@@ -56,9 +56,23 @@ This is a root-level script that builds `@aipk/core` and then runs `packages/cli
 
 ### Deployment
 
-- `server`: any Node host (Render/Fly/Railway free tier). Set all vars from `.env.example` plus `NODE_ENV=production`.
-- `web`: Vercel free tier. Set `NEXT_PUBLIC_API_URL` to the deployed server's URL.
-- Because frontend and backend are different origins in production, the session cookie is set `sameSite: "none"; secure: true` there (and `lax`/non-secure locally, so plain `http://localhost` still works without a TLS cert) — see `packages/server/src/utils/cookies.ts`.
+Both platforms need to know this is an npm-workspaces monorepo where `server`/`web` depend on `@aipk/core` being built first — the settings below account for that.
+
+**Server on Render** (Web Service):
+- Root Directory: leave blank (the repo root — important, *not* `packages/server`, or npm workspace resolution breaks and `@aipk/core` won't be found).
+- Build Command: `npm install && npm run build --workspace=@aipk/core && npm run build --workspace=@aipk/server`
+- Start Command: `npm run start --workspace=@aipk/server`
+- Environment variables: everything from `packages/server/.env.example`, plus `NODE_ENV=production`. Don't set `PORT` — Render injects its own and the server already reads `process.env.PORT`. Set `FRONTEND_ORIGIN` to the exact Vercel URL once you have it (e.g. `https://your-app.vercel.app`, no trailing slash) — CORS and the session cookie both depend on this matching exactly.
+
+**Web on Vercel:**
+- Root Directory: `packages/web` (so Vercel detects it as a Next.js app).
+- In Project Settings → General, enable **"Include source files outside of the Root Directory in the Build Step"** — without this, Vercel can't see the repo root's `package.json`/lockfile/`packages/core`, since it normally isolates the Root Directory.
+- Build Command (override): `cd ../.. && npm run build --workspace=@aipk/core && npm run build --workspace=@aipk/web`
+- Install Command (override): `cd ../.. && npm install`
+- Output Directory: leave as default — Vercel resolves it relative to Root Directory (`packages/web/.next`) regardless of what directory the build command itself `cd`'d into.
+- Environment variables: `NEXT_PUBLIC_API_URL` set to the deployed Render server's URL (e.g. `https://your-server.onrender.com`).
+
+Because frontend and backend are different origins in production, the session cookie is set `sameSite: "none"; secure: true` there (and `lax`/non-secure locally, so plain `http://localhost` still works without a TLS cert) — see `packages/server/src/utils/cookies.ts`.
 
 ## LLM provider
 
@@ -66,7 +80,55 @@ OpenAI, model `gpt-4o-mini`, JSON mode (`response_format: {type: "json_object"}`
 
 ## Architecture
 
-`@aipk/core` is deliberately framework-free — it doesn't import Express, Next, or Mongoose — so the exact same pipeline code runs from an HTTP route (`server`) and from a CLI script (`cli`), which is what §9 requires ("the same code your application uses, not a parallel implementation"). Retrieval, extraction, generation, scheduling, and persistence are separate files with single responsibilities (`extractRequirements.ts`, `discoverHiringPages.ts`, `fetchPublicDiscussion.ts`, `generateCompanyBrief.ts`, `generateQuestions.ts`, `fillGaps.ts`, `scheduler.ts`, `coverage.ts`, `schema.ts`), composed by `orchestrator.ts`. Every I/O step accepts injectable dependencies (`callModel`, `fetchPageFn`, `searchFn`) so its test suite runs against fixtures with zero real network calls.
+**System components and how they talk to each other:**
+
+```
+                     ┌─────────────────────┐
+                     │   Browser (user)     │
+                     └──────────┬───────────┘
+                                │  HTTPS
+                                ▼
+                     ┌─────────────────────┐
+                     │  web (Next.js)       │  deployed on Vercel
+                     │  — auth pages        │
+                     │  — kit builder UI    │
+                     │  — practice/mock     │
+                     └──────────┬───────────┘
+                                │  REST (fetch, credentials:include)
+                                ▼
+                     ┌─────────────────────┐
+                     │  server (Express)    │  deployed on Render
+                     │  — auth routes       │
+                     │  — kit CRUD routes   │
+                     │  — pipelineRunner    │──┐
+                     └──────────┬───────────┘  │
+                                │  Mongoose     │ calls
+                                ▼               ▼
+                     ┌─────────────────┐  ┌─────────────────────┐
+                     │  MongoDB Atlas   │  │     @aipk/core       │
+                     │  (kits, users)   │  │  (pure pipeline:      │
+                     └─────────────────┘  │   crawl, extract,     │
+                                           │   generate, schedule, │
+                                           │   validate)           │
+                                           └──────────┬────────────┘
+                                                       │  outbound HTTP
+                                              ┌────────┴────────┐
+                                              ▼                 ▼
+                                      ┌───────────────┐ ┌───────────────┐
+                                      │  OpenAI API    │ │  Serper API    │
+                                      │  (gpt-4o-mini) │ │  (search)      │
+                                      └───────────────┘ └───────────────┘
+                                                       ▲
+                                                       │ same pipeline, no DB
+                                           ┌───────────┴───────────┐
+                                           │   cli (evaluate.ts)    │
+                                           │   §9 batch entry point │
+                                           └────────────────────────┘
+```
+
+**Why it's split this way:** `@aipk/core` is deliberately framework-free — it doesn't import Express, Next, or Mongoose — so the exact same pipeline code runs from an HTTP route (`server`) and from a CLI script (`cli`), which is what §9 requires ("the same code your application uses, not a parallel implementation"). Retrieval, extraction, generation, scheduling, and persistence are separate files with single responsibilities (`extractRequirements.ts`, `discoverHiringPages.ts`, `fetchPublicDiscussion.ts`, `generateCompanyBrief.ts`, `generateQuestions.ts`, `fillGaps.ts`, `scheduler.ts`, `coverage.ts`, `schema.ts`), composed by `orchestrator.ts`. Every I/O step accepts injectable dependencies (`callModel`, `fetchPageFn`, `searchFn`) so its test suite runs against fixtures with zero real network calls.
+
+**Request flow for creating a kit:** the browser posts to `POST /api/kits`; the server checks the content-hash dedupe, creates a `Kit` document with `pipeline_status: "running"`, and responds `202` immediately rather than holding the connection open for a generation that can take up to ~90 seconds. The actual pipeline run happens detached from that request (`pipelineRunner.ts`), persisting `current_step`/`steps_completed` as it progresses. The browser polls `GET /api/kits/:id` every few seconds until `pipeline_status` leaves `"running"`, which is also what makes a mid-generation page refresh safe — the UI just resumes polling the same persisted state.
 
 ## Retrieval approach and sources
 
@@ -77,6 +139,23 @@ OpenAI, model `gpt-4o-mini`, JSON mode (`response_format: {type: "json_object"}`
 ## Sequencing (why order matters here)
 
 Pasted JD text needs no retrieval, so extraction runs immediately. The crawl and discussion-search run in parallel (neither depends on the other), and **both must finish before the company brief is generated**, since the brief is grounded only in what they actually found — it never runs a general knowledge query. Question generation is **one LLM call per requirement**, with a system prompt selected by that requirement's kind (`technical` leads to technical questions, `behavioural` leads to behavioural, `domain` leads to company-fit) — never one generic call asked to produce every category at once, and never batched unbounded (every generation call runs through a shared concurrency limiter, §9). The coverage check runs after the first full draft and triggers at most one gap-fill pass (capped at 2 total passes) before the kit is validated against the Appendix A schema and persisted.
+
+### What each step is responsible for
+
+| Step (file) | Responsible for |
+|---|---|
+| `extractRequirements.ts` | Pulls role title/seniority/responsibilities and a list of requirements out of the pasted JD text. Also captures each requirement's exact source phrase, which `priorityClassifier.ts` then uses to decide must vs. nice — the LLM never assigns priority itself. |
+| `discoverHiringPages.ts` | Crawls the company's own site (best-first, keyword-scored) to find a careers/hiring/handbook page, up to depth 2 / 15 pages. Returns cleaned page text plus a list of any URLs it had to skip. |
+| `fetchPublicDiscussion.ts` | Runs four Serper queries (general + Glassdoor/Reddit/Blind-scoped) for public commentary on the company's interview process, dedupes results, retrieves them through the same fetch path as the crawler. |
+| `generateCompanyBrief.ts` | Synthesizes a short company brief, grounded strictly in whatever the two steps above actually returned — never a general-knowledge query, and honest ("nothing found") if both come back empty. |
+| `generateQuestions.ts` | Generates interview questions, one LLM call per requirement, with the system prompt (and resulting question category) chosen by that requirement's kind. Bounded by a shared concurrency limiter. |
+| `coverage.ts` | Pure function, no LLM: compares every requirement against every question and returns the ids of any requirement nothing currently covers. |
+| `fillGaps.ts` | Runs `coverage.ts` after the first draft; if anything's uncovered, generates fresh questions for exactly those requirements and checks again. Capped at 2 total passes. |
+| `deriveFlashcards.ts` | Deterministically turns each question into one flashcard (front = prompt, back = answer outline) — no extra LLM call. |
+| `scheduler.ts` | Pure function, no LLM: allocates every question across the requested number of days, must-have and harder material first. |
+| `schema.ts` (`validateKit`) | Validates the fully-assembled kit against Appendix A (types, integer durations, every cross-reference resolving to a real id) before it's ever persisted. |
+| `regenerateSection.ts` | Re-runs one section (brief / schedule / one question category) and merges the result through the §7 state-preservation rules in `regenerate.ts`, so pinned/edited content survives. |
+| `orchestrator.ts` | Composes all of the above into the sequence described above, for both the server and the CLI. |
 
 ## State model: generated / user_edited / user_created / pinned
 
@@ -124,6 +203,20 @@ Regenerating the company brief re-fetches the URLs already recorded in `source.p
 A timed, sequential, typed run through a shuffled subset of the question bank — not just flipping through flashcards. The brief explicitly puts audio/video interview simulation out of scope, so this stays text-based: one question on screen at a time, a countdown (90s/150s/210s by difficulty — a different, shorter scale than the scheduler's study-planning minutes, since this is meant to approximate live response time), a text box, and no going back to fix an earlier answer once you've moved on. At the end, each answer sits next to that question's `answer_outline` for self-review, plus a simple count of how many were answered in time versus timed out.
 
 The problem it solves: flashcard practice (already required) tests recognition — "yes, I know this" — but a real interview tests production under mild time pressure, where you actually have to commit to a specific answer rather than silently confirming to yourself that you probably could. Nothing here is persisted — a mock session is ephemeral practice, not part of the saved Kit, so it needed no new schema field, API route, or pipeline change; it's built entirely from data the kit already has.
+
+## Key design decisions & trade-offs
+
+Pulling the main ones together in one place (each is explained in more depth in its own section above):
+
+- **Crawler is breadth-limited best-first, not plain BFS** (Retrieval) — scores every link by keyword match and always fetches the highest-scoring one across the whole frontier, so the page budget goes to likely-relevant pages instead of being exhausted on low-value same-depth ones first.
+- **Priority (must/nice) is a deterministic keyword classifier, never the LLM's call** (`priorityClassifier.ts`) — the brief is explicit that "required" and "bonus points for" are different things, and leaving that distinction to the model risked it treating everything as a must-have.
+- **One LLM call per requirement for question generation, not one call for everything** (Sequencing) — a React requirement and a "mentors juniors" requirement need different instructions, not the same generic prompt producing both categories at once.
+- **Flashcards are derived deterministically from questions, not a separate LLM call** (`deriveFlashcards.ts`) — saves tokens on a rate-limited free tier for a section that doesn't need independent generation.
+- **Company name is a hostname heuristic, not extracted by the LLM** (Known limitations) — nothing upstream reliably produces a clean name, and guessing from noisy material wasn't worth the extra call.
+- **Schedule is recomputed wholesale on regeneration, then pinned/edited days are spliced back in by day number** (State model) — simpler and more robust than trying to recompute only the "remaining" days around fixed ones.
+- **Regenerating the company brief re-fetches crawled pages but doesn't re-run the discussion search** (State model) — avoids burning Serper's one-time free quota on a section a user is likely to regenerate repeatedly while iterating.
+- **Batch CLI processes cases sequentially, not in parallel** (Batch entry point) — trades wall-clock time (well within the 15-minute budget) for staying under free-tier per-minute token limits.
+- **Monorepo is CommonJS throughout, not ESM** (Tech stack) — avoids Node's `.js`-extension-on-relative-imports requirement across `core`/`server`/`cli`, at no cost to `web` since Next.js interops with CJS transparently.
 
 ## Known limitations
 
